@@ -1,7 +1,7 @@
-import React from "react";
-import { View, Text, StyleSheet, TouchableOpacity, FlatList } from "react-native";
 import { router } from "expo-router";
-import { YARD_LIST } from "./Yards.config";
+import React from "react";
+import { FlatList, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { YARD_LIST } from "../src/Yards.config";
 
 export default function YardSelectScreen() {
   return (

@@ -9,13 +9,6 @@ export default function TabsLayout() {
             tabBarShowLabel: true,
             tabBarActiveTintColor: "#698ee5ff",
             tabBarInactiveTintColor: "#747679ff",
-            // tabBarStyle: {
-            //     backgroundColor: "#0f172a",
-            // },
-            // headerStyle: {
-            //     backgroundColor: "#0f172a",
-            // },
-            // headerTintColor: "#f8fafc",
         }}    
     >
         <Tabs.Screen name='Explore' options={{

@@ -8,20 +8,23 @@ import MapView, { Geojson, Marker, Polyline } from 'react-native-maps';
 // import roadData from '../../assets/data/road2.0.json';
 // import slotData from '../../assets/data/total.json';
 import { FontAwesome5 } from '@expo/vector-icons';
-import { PanGestureHandler } from 'react-native-gesture-handler';
+import { GestureHandlerRootView, PanGestureHandler } from 'react-native-gesture-handler';
 import Animated, {
-  useSharedValue,
   useAnimatedGestureHandler,
   useAnimatedStyle,
+  useSharedValue,
   withSpring
 } from 'react-native-reanimated';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { useLocalSearchParams } from "expo-router";
-import { getYardOrDefault } from "../Yards.config";
+import * as Speech from "expo-speech";
+import { getYardOrDefault } from "../../src/Yards.config";
 
+
+// import Mapbox, { MapView, Camera, ShapeSource, LineLayer } from '@rnmapbox/maps';
 
 export default function Explore() {
+
   const { yard: yardParam } = useLocalSearchParams();
   const yard = getYardOrDefault(yardParam);
   const roadData = yard.roadData;
@@ -55,6 +58,10 @@ export default function Explore() {
   const [showRouteInfo, setShowRouteInfo] = useState(false);
 
   const [steps, setSteps] = useState([]);
+
+  const [navActive, setNavActive] = useState(false);
+  const [activeStepIndex, setActiveStepIndex] = useState(0);
+  const watcherRef = useRef(null);
 
   // inside your component:
   const sheetY = useSharedValue(0); // 0 means fully visible
@@ -95,11 +102,11 @@ export default function Explore() {
   // }, []);
 
   useEffect(() => {
-   // reset graph for new yard
-   graph.current = {};
-   nodeList.current = {};
-   buildGraph(roadData);
- }, [roadData]);
+    // reset graph for new yard
+    graph.current = {};
+    nodeList.current = {};
+    buildGraph(roadData);
+  }, [roadData]);
 
   useEffect(() => {
     (async () => {
@@ -125,10 +132,10 @@ export default function Explore() {
   //   return Array.from(new Set(slotData.features.map(f => f.properties?.Slot_Id)))
   //     .map(slot => ({ label: slot, value: slot }));
   // }, []);
-const slotOptions = useMemo(() => {
-     return Array.from(new Set(slotData.features.map(f => f.properties?.Slot_Id)))
-       .map(slot => ({ label: slot, value: slot }));
-}, [slotData]);
+  const slotOptions = useMemo(() => {
+    return Array.from(new Set(slotData.features.map(f => f.properties?.Slot_Id)))
+      .map(slot => ({ label: slot, value: slot }));
+  }, [slotData]);
 
   const getLotOptions = (slotId) => {
     if (!slotId) return [];
@@ -142,26 +149,30 @@ const slotOptions = useMemo(() => {
 
   function buildGraph(data) {
     const coordStr = (c) => c.join(",");
-    data.features.forEach((f) => {
-      const coords = f.geometry.coordinates;
+
+    const processLine = (coords) => {
       for (let i = 0; i < coords.length - 1; i++) {
         const start = coords[i];
         const end = coords[i + 1];
         const line = turf.lineString([start, end]);
+
         const length = turf.length(line, { units: "kilometers" });
-        const interval = 0.005;
+        const interval = 0.005; // same as Yard 1
         const steps = Math.ceil(length / interval);
+
         let segmentPoints = [];
         for (let j = 0; j <= steps; j++) {
           const pt = turf.along(line, j * interval, { units: "kilometers" }).geometry.coordinates;
-          segmentPoints.push([pt[1], pt[0]]);
+          segmentPoints.push([pt[1], pt[0]]); // lat, lng
         }
+
         for (let k = 0; k < segmentPoints.length - 1; k++) {
           const a = segmentPoints[k];
           const b = segmentPoints[k + 1];
           const aKey = coordStr(a);
           const bKey = coordStr(b);
           const dist = haversine(a, b);
+
           if (!graph.current[aKey]) graph.current[aKey] = {};
           if (!graph.current[bKey]) graph.current[bKey] = {};
           graph.current[aKey][bKey] = dist;
@@ -169,6 +180,19 @@ const slotOptions = useMemo(() => {
           nodeList.current[aKey] = a;
           nodeList.current[bKey] = b;
         }
+      }
+    };
+
+    data.features.forEach((f) => {
+      const geometry = f.geometry;
+      if (!geometry || !geometry.coordinates) return;
+
+      if (geometry.type === "LineString") {
+        processLine(geometry.coordinates);
+      } else if (geometry.type === "MultiLineString") {
+        geometry.coordinates.forEach(line => processLine(line));
+      } else {
+        console.warn("Unsupported geometry type:", geometry.type);
       }
     });
   }
@@ -224,29 +248,38 @@ const slotOptions = useMemo(() => {
   }
 
   function getCoordsFromLot(lotId) {
-    const feature = slotData.features.find(f => f.properties?.lot_id === lotId);
+    const feature = slotData.features.find(
+      f => f.properties?.lot_id?.toString().trim() === lotId.toString().trim()
+    );
+
     if (!feature) {
-      console.warn(`Lot ${lotId} not found`);
+      console.warn(`❌ Lot ${lotId} not found in slotData`);
+      console.log("Available lot_ids:", slotData.features.map(f => f.properties?.lot_id));
       return null;
     }
 
     let lat, lng;
-
     if (feature.geometry.type === "Point") {
       [lng, lat] = feature.geometry.coordinates;
-    } else if (feature.geometry.type === "Polygon") {
-      const centroid = turf.centroid(feature);
-      [lng, lat] = centroid.geometry.coordinates;
-    } else if (feature.geometry.type === "MultiPolygon") {
+    } else if (feature.geometry.type === "Polygon" || feature.geometry.type === "MultiPolygon") {
       const centroid = turf.centroid(feature);
       [lng, lat] = centroid.geometry.coordinates;
     } else {
       console.warn(`Unsupported geometry type: ${feature.geometry.type}`);
       return null;
     }
-    return [lat, lng];
-  }
 
+    console.log([lat, lng])
+    // 🔑 Snap this lot centroid to nearest road node
+    const nearestKey = findNearest([lat, lng]);
+    if (!nearestKey) {
+      console.warn(`⚠️ Could not snap lot ${lotId} to road`);
+      return null;
+    }
+
+    console.log(`✅ Lot ${lotId} snapped to`, nodeList.current[nearestKey]);
+    return nodeList.current[nearestKey];
+  }
 
 
   // Called when Get Directions button clicked
@@ -259,13 +292,18 @@ const slotOptions = useMemo(() => {
     const pickupCoords = getCoordsFromLot(pickupLot);
     const dropCoords = getCoordsFromLot(dropLot);
 
-    const startKey = findNearest(pickupCoords);
-    const endKey = findNearest(dropCoords);
+    const startKey = findNearest(pickupCoords) || null;
+    const endKey = findNearest(dropCoords) || null;
     const pathKeys = dijkstra(startKey, endKey);
     const coordsPath = pathKeys.map(k => ({
       latitude: nodeList.current[k][0],
       longitude: nodeList.current[k][1]
     }));
+
+    console.log("Pickup lot:", pickupLot, "coords:", pickupCoords);
+    console.log("Drop lot:", dropLot, "coords:", dropCoords);
+    console.log("StartKey:", startKey, "EndKey:", endKey);
+    console.log("Path keys:", pathKeys.length);
 
     // ✅ Calculate total distance & ETA
     let totalMeters = 0;
@@ -397,6 +435,101 @@ const slotOptions = useMemo(() => {
     return { name: 'arrow-up', color: '#444', lib: 'FontAwesome5' };
   }
 
+  // 🔊 speak helper
+  function speak(text) {
+    Speech.speak(text, { language: "en-US" });
+  }
+
+  // Start Navigation
+  async function startNavigation() {
+    let loc = await Location.getCurrentPositionAsync({});
+    const userCoords = [loc.coords.latitude, loc.coords.longitude];
+
+    // snap user position
+    const startKey = findNearest(userCoords);
+    const endKey = findNearest(getCoordsFromLot(dropLot));
+
+    if (!startKey || !endKey) {
+      alert("Unable to start navigation, road network missing nearby.");
+      return;
+    }
+
+    const pathKeys = dijkstra(startKey, endKey);
+    const coordsPath = pathKeys.map(k => ({
+      latitude: nodeList.current[k][0],
+      longitude: nodeList.current[k][1],
+    }));
+
+    setRouteCoords(coordsPath);
+
+    if (coordsPath.length >= 2 && mapRef.current) {
+      mapRef.current.fitToCoordinates(coordsPath, {
+        edgePadding: { top: 50, right: 50, bottom: 50, left: 50 },
+        animated: true,
+      });
+    }
+
+    // set active nav
+    setNavActive(true);
+
+    // Rebuild turn-by-turn steps for this new route
+    const builtSteps = buildInstructions(coordsPath);
+    setSteps(builtSteps);
+
+    // Optionally announce first instruction
+    if (builtSteps.length) {
+      speakInstruction(builtSteps[0].text);
+    }
+  }
+
+
+  function speakInstruction(text) {
+    Speech.speak(text, { language: "en", pitch: 1, rate: 1 });
+  }
+
+  // Stop Navigation
+  function stopNavigation() {
+    setNavActive(false);
+    if (watcherRef.current) {
+      watcherRef.current.remove();
+      watcherRef.current = null;
+    }
+    speak("Navigation ended");
+  }
+
+  // match user location to route
+  function handleUserProgress(userCoord) {
+    if (!routeCoords.length || !steps.length) return;
+
+    // find closest step point
+    let nearestStepIdx = activeStepIndex;
+    let minDist = Infinity;
+
+    for (let i = activeStepIndex; i < steps.length; i++) {
+      const step = steps[i];
+      // only check steps with distance
+      if (step.distance > 0) {
+        const stepPoint = [routeCoords[i].latitude, routeCoords[i].longitude];
+        const d = haversine(userCoord, stepPoint);
+        if (d < minDist) {
+          minDist = d;
+          nearestStepIdx = i;
+        }
+      }
+    }
+
+    if (nearestStepIdx !== activeStepIndex) {
+      setActiveStepIndex(nearestStepIdx);
+
+      const step = steps[nearestStepIdx];
+      if (step.type === "turn") {
+        speak(step.text);
+      } else if (step.type === "arrive") {
+        speak("You have arrived at your destination");
+        stopNavigation();
+      }
+    }
+  }
 
 
   return (
@@ -452,58 +585,72 @@ const slotOptions = useMemo(() => {
 
         {showRouteInfo && (
           <GestureHandlerRootView>
-          <PanGestureHandler onGestureEvent={gestureHandler}>
-            <Animated.View style={[styles.routeInfoContent, animatedSheetStyle]}>
-              {/* drag indicator */}
-              <View style={{
-                alignSelf: 'center',
-                width: 40,
-                height: 5,
-                borderRadius: 3,
-                backgroundColor: '#ccc',
-                marginBottom: 8
-              }} />
+            <PanGestureHandler onGestureEvent={gestureHandler}>
+              <Animated.View style={[styles.routeInfoContent, animatedSheetStyle]}>
+                {/* drag indicator */}
+                <View style={{
+                  alignSelf: 'center',
+                  width: 40,
+                  height: 5,
+                  borderRadius: 3,
+                  backgroundColor: '#ccc',
+                  marginBottom: 8
+                }} />
 
-              {/* Close button */}
-              <TouchableOpacity
-                style={styles.routeCloseBtn}
-                onPress={() => {
-                  setShowRouteInfo(false);
-                  setRouteCoords([]);
-                  setSteps([]);
-                }}
-              >
-                <Ionicons name="close" size={20} color="#000" />
-              </TouchableOpacity>
+                {/* Close button */}
+                <TouchableOpacity
+                  style={styles.routeCloseBtn}
+                  onPress={() => {
+                    setShowRouteInfo(false);
+                    setNavActive(false);
+                    setRouteCoords([]);
+                    setSteps([]);
+                  }}
+                >
+                  <Ionicons name="close" size={20} color="#000" />
+                </TouchableOpacity>
 
-              {/* Distance & ETA */}
-              <View style={{ marginTop: 5 }}>
-                <Text style={styles.routeInfoText}>Distance: {distance}</Text>
-                <Text style={styles.routeInfoText}>ETA: {eta}</Text>
-              </View>
+                {/* Start/Stop Button inside panel */}
+                {!navActive ? (
+                  <TouchableOpacity style={styles.startSmallBtn} onPress={startNavigation}>
+                    <FontAwesome5 name="play" size={14} color="white" />
+                    <Text style={styles.btnText}>Start</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity style={[styles.startSmallBtn, { backgroundColor: "red" }]} onPress={stopNavigation}>
+                    <FontAwesome5 name="stop" size={14} color="white" />
+                    <Text style={styles.btnText}>Stop</Text>
+                  </TouchableOpacity>
+                )}
 
-              {/* Step-by-step list */}
-              {!!steps.length && (
-                <View style={styles.directionsList}>
-                  {steps.map((s, idx) => {
-                    const icon = iconForStep(s);
-                    return (
-                      <View key={idx} style={styles.directionRow}>
-                        {icon.lib === 'FontAwesome5' ? (
-                          <FontAwesome5 name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
-                        ) : (
-                          <Ionicons name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
-                        )}
-                        <Text style={styles.directionItem}>
-                          {s.text}{s.distance > 0 ? ` for ${formatDistance(s.distance)}` : ''}
-                        </Text>
-                      </View>
-                    );
-                  })}
+                {/* Distance & ETA */}
+                <View style={{ marginTop: 5 }}>
+                  <Text style={styles.routeInfoText}>Distance: {distance}</Text>
+                  <Text style={styles.routeInfoText}>ETA: {eta}</Text>
                 </View>
-              )}
-            </Animated.View>
-          </PanGestureHandler>
+
+                {/* Step-by-step list */}
+                {!!steps.length && (
+                  <View style={styles.directionsList}>
+                    {steps.map((s, idx) => {
+                      const icon = iconForStep(s);
+                      return (
+                        <View key={idx} style={styles.directionRow}>
+                          {icon.lib === 'FontAwesome5' ? (
+                            <FontAwesome5 name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
+                          ) : (
+                            <Ionicons name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
+                          )}
+                          <Text style={styles.directionItem}>
+                            {s.text}{s.distance > 0 ? ` for ${formatDistance(s.distance)}` : ''}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                )}
+              </Animated.View>
+            </PanGestureHandler>
           </GestureHandlerRootView>
         )}
 
@@ -754,5 +901,21 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: 4
+  },
+  startSmallBtn: {
+    alignSelf: "flex-start",   // left aligned
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "green",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+    marginBottom: 10
+  },
+  btnText: {
+    color: "white",
+    marginLeft: 6,
+    fontSize: 14,
+    fontWeight: "600"
   }
 });

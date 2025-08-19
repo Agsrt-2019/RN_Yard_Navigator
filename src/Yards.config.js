@@ -23,7 +23,7 @@ export const YARDS = {
       latitudeDelta: 0.01,
       longitudeDelta: 0.01,
     },
-    roadData: require("../assets/data/yard2/road_ma.json"),
+    roadData: require("../assets/data/yard2/road_ma_updated.json"),
     slotData: require("../assets/data/yard2/total_ma.json"),
   },
   // add more yards here...
