@@ -2,7 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as turf from '@turf/turf';
 import * as Location from 'expo-location';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Keyboard, Modal, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, TouchableWithoutFeedback, View } from 'react-native';
+import { Keyboard, Modal, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, TouchableWithoutFeedback, View, Platform, Image } from 'react-native';
 import DropDownPicker from 'react-native-dropdown-picker';
 import MapView, { Geojson, Marker, Polyline } from 'react-native-maps';
 // import roadData from '../../assets/data/road2.0.json';
@@ -19,9 +19,13 @@ import Animated, {
 import { useLocalSearchParams } from "expo-router";
 import * as Speech from "expo-speech";
 import { getYardOrDefault } from "../../src/Yards.config";
+import { Dimensions } from "react-native";
+const { height: SCREEN_HEIGHT } = Dimensions.get("window");
 
-
-// import Mapbox, { MapView, Camera, ShapeSource, LineLayer } from '@rnmapbox/maps';
+const SNAP_POINTS = {
+  COLLAPSED: 0.22, // 20% height
+  EXPANDED: 0.5,  // 50% height
+};
 
 export default function Explore() {
 
@@ -63,6 +67,10 @@ export default function Explore() {
   const [activeStepIndex, setActiveStepIndex] = useState(0);
   const watcherRef = useRef(null);
 
+  const [userPosition, setUserPosition] = useState(null);
+  const [userHeading, setUserHeading] = useState(0);
+  const [isFollowing, setIsFollowing] = useState(true);
+
   // inside your component:
   const sheetY = useSharedValue(0); // 0 means fully visible
   const maxDrag = 250; // how much it can go down
@@ -75,26 +83,37 @@ export default function Explore() {
   // };
   const initialRegion = yard.initialRegion;
 
+  const translateY = useSharedValue(SCREEN_HEIGHT * (1 - SNAP_POINTS.COLLAPSED));
+
   const gestureHandler = useAnimatedGestureHandler({
     onStart: (_, ctx) => {
-      ctx.startY = sheetY.value;
+      ctx.startY = translateY.value;
     },
     onActive: (event, ctx) => {
-      sheetY.value = Math.min(Math.max(ctx.startY + event.translationY, 0), maxDrag);
+      translateY.value = ctx.startY + event.translationY;
+      translateY.value = Math.max(
+        SCREEN_HEIGHT * (1 - SNAP_POINTS.EXPANDED),
+        Math.min(translateY.value, SCREEN_HEIGHT * (1 - SNAP_POINTS.COLLAPSED))
+      );
     },
     onEnd: () => {
-      // snap to top if less than half dragged
-      if (sheetY.value < maxDrag / 2) {
-        sheetY.value = withSpring(0);
-      } else {
-        sheetY.value = withSpring(maxDrag);
-      }
-    }
+      // snap to nearest point
+      const midPoint =
+        (SCREEN_HEIGHT * (1 - SNAP_POINTS.COLLAPSED) +
+          SCREEN_HEIGHT * (1 - SNAP_POINTS.EXPANDED)) /
+        2;
+      translateY.value =
+        translateY.value < midPoint
+          ? SCREEN_HEIGHT * (1 - SNAP_POINTS.EXPANDED)
+          : SCREEN_HEIGHT * (1 - SNAP_POINTS.COLLAPSED);
+    },
   });
 
-  const animatedSheetStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: sheetY.value }]
-  }));
+  const animatedSheetStyle = useAnimatedStyle(() => {
+    return {
+      transform: [{ translateY: translateY.value }],
+    };
+  });
 
   // Build graph once
   // useEffect(() => {
@@ -424,16 +443,32 @@ export default function Explore() {
   }
 
   function iconForStep(step) {
-    if (step.type === 'arrive') return { name: 'flag-checkered', color: '#0a7', lib: 'FontAwesome5' };
-    if (step.type === 'start') return { name: 'play', color: '#007AFF', lib: 'FontAwesome5' };
-    if (step.type === 'turn') {
-      if (step.text.includes('left')) return { name: 'arrow-left', color: '#007AFF', lib: 'FontAwesome5' };
-      if (step.text.includes('right')) return { name: 'arrow-right', color: '#007AFF', lib: 'FontAwesome5' };
-      return { name: 'undo', color: '#f33', lib: 'FontAwesome5' }; // U-turn fallback
+    if (!step) {
+      return { name: "help-circle", color: "gray", lib: "Ionicons" };
     }
-    // straight/slight
-    return { name: 'arrow-up', color: '#444', lib: 'FontAwesome5' };
+
+    if (step.type === "arrive") {
+      return { name: "flag-checkered", color: "#0a7", lib: "FontAwesome5" };
+    }
+
+    if (step.type === "start") {
+      return { name: "play", color: "#007AFF", lib: "FontAwesome5" };
+    }
+
+    if (step.type === "turn") {
+      if (step.text?.toLowerCase().includes("left")) {
+        return { name: "arrow-left", color: "#007AFF", lib: "FontAwesome5" };
+      }
+      if (step.text?.toLowerCase().includes("right")) {
+        return { name: "arrow-right", color: "#007AFF", lib: "FontAwesome5" };
+      }
+      return { name: "undo", color: "#f33", lib: "FontAwesome5" }; // fallback U-turn
+    }
+
+    // straight/slight fallback
+    return { name: "arrow-up", color: "#444", lib: "FontAwesome5" };
   }
+
 
   // 🔊 speak helper
   function speak(text) {
@@ -469,63 +504,127 @@ export default function Explore() {
       });
     }
 
-    // set active nav
+    // ✅ Activate navigation
     setNavActive(true);
 
-    // Rebuild turn-by-turn steps for this new route
+    // Build step instructions
     const builtSteps = buildInstructions(coordsPath);
     setSteps(builtSteps);
+    setActiveStepIndex(0);
 
-    // Optionally announce first instruction
+    // ✅ Start watching user location + heading
+    watcherRef.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.High,
+        timeInterval: 2000,   // every 2 sec
+        distanceInterval: 3,  // every 3 meters
+      },
+      (locUpdate) => {
+        const { latitude, longitude, heading } = locUpdate.coords;
+        console.log("📍 User update:", { latitude, longitude, heading });
+
+        // update arrow position + heading
+        setUserPosition({ latitude, longitude });   // 👈 object, not array
+        if (heading !== null) setUserHeading(heading);
+
+        // DEBUG: log before calling handleUserProgress
+        console.log("➡️ Calling handleUserProgress with:", [latitude, longitude]);
+        try {
+          handleUserProgress([latitude, longitude]);
+        } catch (err) {
+          console.error("❌ Error in handleUserProgress:", err);
+        }
+
+        if (isFollowing && mapRef.current) {
+          mapRef.current.animateCamera({
+            center: { latitude, longitude },
+            heading: heading ?? 0,
+            pitch: 45,
+            zoom: 18,
+          });
+        }
+
+        // make map follow + rotate with user
+        if (mapRef.current) {
+          mapRef.current.animateCamera({
+            center: { latitude, longitude },
+            heading: heading ?? 0,
+            pitch: 45,  // tilt a bit for 3D effect
+            zoom: 18,   // zoom in close
+          });
+        }
+
+        // progress tracking (turn-by-turn)
+        const userCoord = [latitude, longitude];
+        handleUserProgress([latitude, longitude]);
+      }
+    );
+
+    // Announce first instruction
     if (builtSteps.length) {
       speakInstruction(builtSteps[0].text);
     }
   }
 
-
   function speakInstruction(text) {
     Speech.speak(text, { language: "en", pitch: 1, rate: 1 });
   }
 
-  // Stop Navigation
+  //stopNavigation
   function stopNavigation() {
     setNavActive(false);
+    setUserPosition(null);
+    setUserHeading(0);
+
     if (watcherRef.current) {
       watcherRef.current.remove();
       watcherRef.current = null;
     }
+
+    setActiveStepIndex(0);
     speak("Navigation ended");
   }
 
+
   // match user location to route
   function handleUserProgress(userCoord) {
-    if (!routeCoords.length || !steps.length) return;
+    if (!routeCoords.length || !steps.length) {
+      console.log("⚠️ Skipping progress check, no route or steps.");
+      return;
+    }
 
-    // find closest step point
-    let nearestStepIdx = activeStepIndex;
     let minDist = Infinity;
+    let nearestIdx = activeStepIndex;
 
-    for (let i = activeStepIndex; i < steps.length; i++) {
-      const step = steps[i];
-      // only check steps with distance
-      if (step.distance > 0) {
-        const stepPoint = [routeCoords[i].latitude, routeCoords[i].longitude];
-        const d = haversine(userCoord, stepPoint);
-        if (d < minDist) {
-          minDist = d;
-          nearestStepIdx = i;
-        }
+    // Find closest step point
+    for (let i = activeStepIndex; i < routeCoords.length; i++) {
+      const stepPoint = [routeCoords[i].latitude, routeCoords[i].longitude];
+      const d = haversine(userCoord, stepPoint);
+      if (d < minDist) {
+        minDist = d;
+        nearestIdx = i;
       }
     }
 
-    if (nearestStepIdx !== activeStepIndex) {
-      setActiveStepIndex(nearestStepIdx);
+    // ✅ Safely get current step
+    const step = steps[activeStepIndex];
+    console.log("🔍 activeStepIndex:", activeStepIndex, "step:", step);
 
-      const step = steps[nearestStepIdx];
-      if (step.type === "turn") {
-        speak(step.text);
-      } else if (step.type === "arrive") {
-        speak("You have arrived at your destination");
+    if (step && step.type === "turn" && minDist <= 50 && !step.preAlerted) {
+      speakInstruction(`In 50 meters, ${step.text.toLowerCase()}`);
+      step.preAlerted = true;
+    }
+
+    // ✅ Step transition logic
+    if (nearestIdx > activeStepIndex && nearestIdx < steps.length) {
+      setActiveStepIndex(nearestIdx);
+      const newStep = steps[nearestIdx];
+      console.log("➡️ Transition to step:", nearestIdx, newStep);
+
+      if (newStep?.type === "turn") {
+        speakInstruction(newStep.text);
+      } else if (newStep?.type === "arrive") {
+        speakInstruction("You have arrived at your destination");
         stopNavigation();
       }
     }
@@ -537,23 +636,29 @@ export default function Explore() {
       <View style={styles.container}>
         <MapView
           ref={mapRef}
+          provider="google"
           style={styles.map}
           showsUserLocation
-          mapType="mutedStandard"
+          mapType={Platform.OS === "ios" ? "mutedStandard" : "standard"}
           initialRegion={initialRegion}
           scrollEnabled={!showDirections}
           zoomEnabled={!showDirections}
           pitchEnabled={!showDirections}
           rotateEnabled={!showDirections}
+          onPanDrag={() => setIsFollowing(false)}
         >
-          <Geojson
-            geojson={roadData}
-            strokeColor="red"
-            fillColor="rgba(255,0,0,0.2)"
-            strokeWidth={2}
-          />
+          {/* Yard roads */}
+          {roadData && (
+            <Geojson
+              geojson={roadData}
+              strokeColor="red"
+              fillColor="rgba(255,0,0,0.2)"
+              strokeWidth={2}
+            />
+          )}
+
           {/* Route Polyline */}
-          {routeCoords.length >= 2 && (
+          {routeCoords.length >= 2 && routeCoords.every(p => p?.latitude && p?.longitude) && (
             <>
               <Polyline
                 coordinates={routeCoords}
@@ -561,31 +666,73 @@ export default function Explore() {
                 strokeWidth={4}
               />
 
-              {/* Start marker: small white circle */}
-              <Marker coordinate={routeCoords[0]} anchor={{ x: 0.5, y: 0.5 }}>
-                <View
-                  style={{
-                    width: 14,
-                    height: 14,
-                    borderRadius: 7,
-                    backgroundColor: 'white',
-                    borderWidth: 2,
-                    borderColor: 'black'
-                  }}
-                />
-              </Marker>
+              {/* ✅ Before navigation: show static white start circle */}
+              {!navActive && routeCoords[0]?.latitude && (
+                <Marker coordinate={routeCoords[0]} anchor={{ x: 0.5, y: 0.5 }}>
+                  <View
+                    style={{
+                      width: 14,
+                      height: 14,
+                      borderRadius: 7,
+                      backgroundColor: "white",
+                      borderWidth: 2,
+                      borderColor: "black",
+                    }}
+                  />
+                </Marker>
+              )}
 
-              {/* Destination marker: red location pin */}
-              <Marker coordinate={routeCoords[routeCoords.length - 1]} anchor={{ x: 0.5, y: 1 }}>
-                <FontAwesome5 name="map-marker-alt" size={32} color="red" />
-              </Marker>
+              {/* ✅ After navigation: arrow marker (only if image exists) */}
+              {navActive && userPosition?.latitude && (
+                <Marker coordinate={userPosition} anchor={{ x: 0.5, y: 0.5 }} flat>
+                  <Image
+                    source={require("../../assets/images/up-arrow.png")} // double-check this path
+                    style={{
+                      width: 40,
+                      height: 40,
+                      transform: [{ rotate: `${userHeading || 0}deg` }],
+                    }}
+                    resizeMode="contain"
+                  />
+                </Marker>
+              )}
+
+              {/* Destination marker: red pin */}
+              {routeCoords[routeCoords.length - 1]?.latitude && (
+                <Marker coordinate={routeCoords[routeCoords.length - 1]}>
+                  <FontAwesome5 name="map-marker-alt" size={32} color="red" />
+                </Marker>
+              )}
+
+              {/* Re-center button */}
+              {navActive && userPosition?.latitude && (
+                <TouchableOpacity
+                  style={styles.recenterButton}
+                  onPress={() => {
+                    if (mapRef.current) {
+                      setIsFollowing(true);
+                      mapRef.current.animateCamera({
+                        center: {
+                          latitude: userPosition.latitude,
+                          longitude: userPosition.longitude,
+                        },
+                        heading: userHeading ?? 0,
+                        pitch: 45,
+                        zoom: 18,
+                      });
+                    }
+                  }}
+                >
+                  <FontAwesome5 name="location-arrow" size={20} color="white" />
+                </TouchableOpacity>
+              )}
             </>
           )}
         </MapView>
 
         {showRouteInfo && (
           <GestureHandlerRootView>
-            <PanGestureHandler onGestureEvent={gestureHandler}>
+            <PanGestureHandler onGestureEvent={gestureHandler} simultaneousHandlers={mapRef}>
               <Animated.View style={[styles.routeInfoContent, animatedSheetStyle]}>
                 {/* drag indicator */}
                 <View style={{
@@ -633,7 +780,13 @@ export default function Explore() {
                 {!!steps.length && (
                   <View style={styles.directionsList}>
                     {steps.map((s, idx) => {
+                      if (!s) {
+                        console.warn("⚠️ Undefined step at index", idx, steps);
+                        return null;
+                      }
+
                       const icon = iconForStep(s);
+
                       return (
                         <View key={idx} style={styles.directionRow}>
                           {icon.lib === 'FontAwesome5' ? (
@@ -642,7 +795,7 @@ export default function Explore() {
                             <Ionicons name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
                           )}
                           <Text style={styles.directionItem}>
-                            {s.text}{s.distance > 0 ? ` for ${formatDistance(s.distance)}` : ''}
+                            {s?.text}{s?.distance > 0 ? ` for ${formatDistance(s.distance)}` : ''}
                           </Text>
                         </View>
                       );
@@ -864,19 +1017,15 @@ const styles = StyleSheet.create({
     marginVertical: 10
   },
   routeInfoContent: {
-    position: 'absolute',
+    position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: 'white',
-    padding: 20,
-    borderTopLeftRadius: 12,
-    borderTopRightRadius: 12,
-    shadowColor: '#000',
-    shadowOpacity: 0.1,
-    shadowRadius: 6,
-    elevation: 6,
-    zIndex: 999
+    height: SCREEN_HEIGHT, // full screen, but we control how much is shown
+    backgroundColor: "white",
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 12,
   },
   routeInfoText: {
     fontSize: 16,
@@ -917,5 +1066,18 @@ const styles = StyleSheet.create({
     marginLeft: 6,
     fontSize: 14,
     fontWeight: "600"
+  },
+  recenterButton: {
+    position: "absolute",
+    bottom: 200, // adjust above bottom panel
+    left: 20,
+    backgroundColor: "#007AFF",
+    padding: 12,
+    borderRadius: 30,
+    elevation: 5,   // Android shadow
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 3,
   }
 });
