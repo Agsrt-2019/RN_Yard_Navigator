@@ -1,25 +1,23 @@
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, FontAwesome5 } from '@expo/vector-icons';
 import * as turf from '@turf/turf';
 import * as Location from 'expo-location';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Keyboard, Modal, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, TouchableWithoutFeedback, View, Platform, Image } from 'react-native';
+import { Keyboard, Modal, Platform, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, TouchableWithoutFeedback, View, Image } from 'react-native';
 import DropDownPicker from 'react-native-dropdown-picker';
 import MapView, { Geojson, Marker, Polyline } from 'react-native-maps';
 // import roadData from '../../assets/data/road2.0.json';
 // import slotData from '../../assets/data/total.json';
-import { FontAwesome5 } from '@expo/vector-icons';
 import { GestureHandlerRootView, PanGestureHandler } from 'react-native-gesture-handler';
 import Animated, {
   useAnimatedGestureHandler,
   useAnimatedStyle,
-  useSharedValue,
-  withSpring
+  useSharedValue
 } from 'react-native-reanimated';
 
 import { useLocalSearchParams } from "expo-router";
 import * as Speech from "expo-speech";
-import { getYardOrDefault } from "../../src/Yards.config";
 import { Dimensions } from "react-native";
+import { getYardOrDefault } from "../../src/Yards.config";
 const { height: SCREEN_HEIGHT } = Dimensions.get("window");
 
 const SNAP_POINTS = {
@@ -70,6 +68,17 @@ export default function Explore() {
   const [userPosition, setUserPosition] = useState(null);
   const [userHeading, setUserHeading] = useState(0);
   const [isFollowing, setIsFollowing] = useState(true);
+
+  const [currentInstruction, setCurrentInstruction] = useState(null);
+  const [nextInstruction, setNextInstruction] = useState(null);
+
+
+  // ↓ add these lines here
+  const [tracks, setTracks] = useState(true);
+  useEffect(() => {
+    const t = setTimeout(() => setTracks(false), 500); // stop tracking after the first paint
+    return () => clearTimeout(t);
+  }, []);
 
   // inside your component:
   const sheetY = useSharedValue(0); // 0 means fully visible
@@ -504,67 +513,38 @@ export default function Explore() {
       });
     }
 
-    // ✅ Activate navigation
+    // Activate navigation
     setNavActive(true);
 
     // Build step instructions
-    const builtSteps = buildInstructions(coordsPath);
-    setSteps(builtSteps);
+    const built = buildInstructions(coordsPath);
+    setSteps(built);
     setActiveStepIndex(0);
+    setCurrentInstruction(built[0] || null);
+    setNextInstruction(built[1] || null);
 
-    // ✅ Start watching user location + heading
+    // Start watching user location + heading
     watcherRef.current = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.High,
-        timeInterval: 2000,   // every 2 sec
-        distanceInterval: 3,  // every 3 meters
+        timeInterval: 2000,
+        distanceInterval: 3,
       },
       (locUpdate) => {
         const { latitude, longitude, heading } = locUpdate.coords;
-        console.log("📍 User update:", { latitude, longitude, heading });
-
-        // update arrow position + heading
-        setUserPosition({ latitude, longitude });   // 👈 object, not array
+        setUserPosition({ latitude, longitude });
         if (heading !== null) setUserHeading(heading);
 
-        // DEBUG: log before calling handleUserProgress
-        console.log("➡️ Calling handleUserProgress with:", [latitude, longitude]);
-        try {
-          handleUserProgress([latitude, longitude]);
-        } catch (err) {
-          console.error("❌ Error in handleUserProgress:", err);
-        }
-
-        if (isFollowing && mapRef.current) {
-          mapRef.current.animateCamera({
-            center: { latitude, longitude },
-            heading: heading ?? 0,
-            pitch: 45,
-            zoom: 18,
-          });
-        }
-
-        // make map follow + rotate with user
-        if (mapRef.current) {
-          mapRef.current.animateCamera({
-            center: { latitude, longitude },
-            heading: heading ?? 0,
-            pitch: 45,  // tilt a bit for 3D effect
-            zoom: 18,   // zoom in close
-          });
-        }
-
-        // progress tracking (turn-by-turn)
-        const userCoord = [latitude, longitude];
         handleUserProgress([latitude, longitude]);
       }
     );
 
     // Announce first instruction
-    if (builtSteps.length) {
-      speakInstruction(builtSteps[0].text);
+    if (built.length) {
+      speakInstruction(built[0].text);
     }
   }
+
 
   function speakInstruction(text) {
     Speech.speak(text, { language: "en", pitch: 1, rate: 1 });
@@ -572,9 +552,12 @@ export default function Explore() {
 
   //stopNavigation
   function stopNavigation() {
+    setCurrentInstruction(null);
+    setNextInstruction(null);
     setNavActive(false);
     setUserPosition(null);
     setUserHeading(0);
+
 
     if (watcherRef.current) {
       watcherRef.current.remove();
@@ -588,52 +571,105 @@ export default function Explore() {
 
   // match user location to route
   function handleUserProgress(userCoord) {
-    if (!routeCoords.length || !steps.length) {
-      console.log("⚠️ Skipping progress check, no route or steps.");
-      return;
-    }
+    if (!routeCoords.length || !steps.length) return;
 
+    // Find closest point on the route to the user
     let minDist = Infinity;
-    let nearestIdx = activeStepIndex;
-
-    // Find closest step point
-    for (let i = activeStepIndex; i < routeCoords.length; i++) {
-      const stepPoint = [routeCoords[i].latitude, routeCoords[i].longitude];
-      const d = haversine(userCoord, stepPoint);
+    let closestIdx = 0;
+    for (let i = 0; i < routeCoords.length; i++) {
+      const p = routeCoords[i];
+      const d = haversine(userCoord, [p.latitude, p.longitude]);
       if (d < minDist) {
         minDist = d;
-        nearestIdx = i;
+        closestIdx = i;
       }
     }
 
-    // ✅ Safely get current step
-    const step = steps[activeStepIndex];
-    console.log("🔍 activeStepIndex:", activeStepIndex, "step:", step);
+    // Move to next step when passing its anchor point
+    // (we use the closest route point index as a coarse proxy)
+    if (closestIdx >= activeStepIndex && closestIdx < steps.length) {
+      setActiveStepIndex(closestIdx);
 
-    if (step && step.type === "turn" && minDist <= 50 && !step.preAlerted) {
-      speakInstruction(`In 50 meters, ${step.text.toLowerCase()}`);
-      step.preAlerted = true;
-    }
+      const cur = steps[closestIdx];
+      const nxt = steps[closestIdx + 1] || null;
 
-    // ✅ Step transition logic
-    if (nearestIdx > activeStepIndex && nearestIdx < steps.length) {
-      setActiveStepIndex(nearestIdx);
-      const newStep = steps[nearestIdx];
-      console.log("➡️ Transition to step:", nearestIdx, newStep);
+      setCurrentInstruction(cur || null);
+      setNextInstruction(nxt);
 
-      if (newStep?.type === "turn") {
-        speakInstruction(newStep.text);
-      } else if (newStep?.type === "arrive") {
-        speakInstruction("You have arrived at your destination");
+      // Pre-alert when approaching a turn (50 m)
+      if (cur?.type === 'turn' && minDist <= 50 && !cur.preAlerted) {
+        speakInstruction(`In 50 meters, ${cur.text.toLowerCase()}`);
+        cur.preAlerted = true; // mark so we don't repeat
+      }
+
+      // Speak on transition
+      if (cur?.type === 'turn') {
+        speakInstruction(cur.text);
+      } else if (cur?.type === 'arrive') {
+        speakInstruction('You have arrived at your destination');
         stopNavigation();
+        // optional: clear bar after a short delay
+        setTimeout(() => {
+          setCurrentInstruction(null);
+          setNextInstruction(null);
+        }, 5000);
       }
     }
   }
 
 
+  useEffect(() => {
+    initLocation();
+  }, []);
+
+  async function initLocation() {
+    try {
+      const servicesOn = await Location.hasServicesEnabledAsync();
+      if (!servicesOn) {
+        alert("Please enable Location Services");
+        return;
+      }
+
+      let perm = await Location.getForegroundPermissionsAsync();
+      if (perm.status !== "granted") {
+        perm = await Location.requestForegroundPermissionsAsync();
+      }
+      if (perm.status !== "granted") {
+        alert("Location permission not granted");
+        return;
+      }
+
+      const loc = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Highest,
+      });
+      setLocation(loc.coords);
+    } catch (e) {
+      console.warn("initLocation error:", e);
+    }
+  }
+
+
+
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
       <View style={styles.container}>
+        {navActive && currentInstruction && (
+          <View style={styles.instructionBar}>
+            <Text style={styles.instructionText}>
+              {currentInstruction?.text}
+              {currentInstruction?.distance > 0
+                ? ` for ${formatDistance(currentInstruction.distance)}`
+                : ''}
+            </Text>
+
+            {nextInstruction && (
+              <Text style={styles.instructionSubText}>
+                Then {nextInstruction.text.toLowerCase()}
+              </Text>
+            )}
+          </View>
+        )}
+
         <MapView
           ref={mapRef}
           provider="google"
@@ -650,6 +686,7 @@ export default function Explore() {
           {/* Yard roads */}
           {roadData && (
             <Geojson
+              key="yard-roads"
               geojson={roadData}
               strokeColor="red"
               fillColor="rgba(255,0,0,0.2)"
@@ -658,77 +695,89 @@ export default function Explore() {
           )}
 
           {/* Route Polyline */}
-          {routeCoords.length >= 2 && routeCoords.every(p => p?.latitude && p?.longitude) && (
-            <>
-              <Polyline
-                coordinates={routeCoords}
-                strokeColor="blue"
-                strokeWidth={4}
-              />
+          {routeCoords.length >= 2 &&
+            routeCoords.every(p => p?.latitude && p?.longitude) && (
+              <>
+                <Polyline
+                  key={`polyline-${routeCoords.length}`}
+                  coordinates={routeCoords}
+                  strokeColor="red"
+                  strokeWidth={4}
+                />
 
-              {/* ✅ Before navigation: show static white start circle */}
-              {!navActive && routeCoords[0]?.latitude && (
-                <Marker coordinate={routeCoords[0]} anchor={{ x: 0.5, y: 0.5 }}>
-                  <View
-                    style={{
-                      width: 14,
-                      height: 14,
-                      borderRadius: 7,
-                      backgroundColor: "white",
-                      borderWidth: 2,
-                      borderColor: "black",
-                    }}
-                  />
-                </Marker>
-              )}
+                {/* ✅ Before navigation: static white start circle */}
+                {!navActive && routeCoords[0]?.latitude && (
+                  <Marker
+                    key="start-marker"
+                    coordinate={routeCoords[0]}
+                    anchor={{ x: 0.5, y: 0.5 }}
+                  >
+                    <View
+                      style={{
+                        width: 14,
+                        height: 14,
+                        borderRadius: 7,
+                        backgroundColor: "white",
+                        borderWidth: 2,
+                        borderColor: "black",
+                      }}
+                    />
+                  </Marker>
+                )}
 
-              {/* ✅ After navigation: arrow marker (only if image exists) */}
-              {navActive && userPosition?.latitude && (
-                <Marker coordinate={userPosition} anchor={{ x: 0.5, y: 0.5 }} flat>
-                  <Image
-                    source={require("../../assets/images/up-arrow.png")} // double-check this path
-                    style={{
-                      width: 40,
-                      height: 40,
-                      transform: [{ rotate: `${userHeading || 0}deg` }],
-                    }}
-                    resizeMode="contain"
-                  />
-                </Marker>
-              )}
+                {/* ✅ After navigation: arrow marker */}
+                {navActive && userPosition?.latitude && (
+                  <Marker
+                    coordinate={userPosition}
+                    anchor={{ x: 0.5, y: 0.5 }}
+                    flat
+                    tracksViewChanges={tracks}
+                    rotation={userHeading || 0}
+                  >
+                    <Image
+                      source={require("../../assets/images/up-arrow.png")}
+                      style={{
+                        width: 40,
+                        height: 40,
+                        transform: [{ rotate: `${userHeading || 0}deg` }],
+                      }}
+                      resizeMode="contain"
+                    />
+                  </Marker>
+                )}
 
-              {/* Destination marker: red pin */}
-              {routeCoords[routeCoords.length - 1]?.latitude && (
-                <Marker coordinate={routeCoords[routeCoords.length - 1]}>
-                  <FontAwesome5 name="map-marker-alt" size={32} color="red" />
-                </Marker>
-              )}
-
-              {/* Re-center button */}
-              {navActive && userPosition?.latitude && (
-                <TouchableOpacity
-                  style={styles.recenterButton}
-                  onPress={() => {
-                    if (mapRef.current) {
-                      setIsFollowing(true);
-                      mapRef.current.animateCamera({
-                        center: {
-                          latitude: userPosition.latitude,
-                          longitude: userPosition.longitude,
-                        },
-                        heading: userHeading ?? 0,
-                        pitch: 45,
-                        zoom: 18,
-                      });
-                    }
-                  }}
-                >
-                  <FontAwesome5 name="location-arrow" size={20} color="white" />
-                </TouchableOpacity>
-              )}
-            </>
-          )}
+                {/* Destination marker */}
+                {routeCoords[routeCoords.length - 1]?.latitude && (
+                  <Marker
+                    key="destination-marker"
+                    coordinate={routeCoords[routeCoords.length - 1]}
+                  >
+                    <FontAwesome5 name="map-marker-alt" size={32} color="red" />
+                  </Marker>
+                )}
+              </>
+            )}
         </MapView>
+
+        {/* Re-center button */}
+        {navActive && userPosition?.latitude && (
+          <TouchableOpacity
+            style={styles.recenterButton}
+            onPress={() => {
+              if (mapRef.current) {
+                setIsFollowing(true);
+                mapRef.current.animateCamera({
+                  center: { latitude: userPosition.latitude, longitude: userPosition.longitude },
+                  heading: userHeading != null ? userHeading : 0,
+                  pitch: 45,
+                  zoom: 18,
+                });
+              }
+            }}
+          >
+            <FontAwesome5 name="location-arrow" size={20} color="white" />
+          </TouchableOpacity>
+        )}
 
         {showRouteInfo && (
           <GestureHandlerRootView>
@@ -788,7 +837,7 @@ export default function Explore() {
                       const icon = iconForStep(s);
 
                       return (
-                        <View key={idx} style={styles.directionRow}>
+                        <View key={`${s.type}-${idx}`} style={styles.directionRow}>
                           {icon.lib === 'FontAwesome5' ? (
                             <FontAwesome5 name={icon.name} size={16} color={icon.color} style={{ marginRight: 6 }} />
                           ) : (
@@ -1079,5 +1128,31 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 3,
-  }
+  },
+  instructionBar: {
+    position: 'absolute',
+    top: 80,
+    left: 10,
+    right: 10,
+    backgroundColor: '#007AFF',
+    padding: 12,
+    borderRadius: 10,
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    zIndex: 9999,
+  },
+  instructionText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  instructionSubText: {
+    color: 'white',
+    fontSize: 14,
+    marginTop: 4,
+    opacity: 0.9,
+  },
+
 });
