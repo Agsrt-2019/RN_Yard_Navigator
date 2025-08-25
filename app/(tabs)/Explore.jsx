@@ -72,6 +72,21 @@ export default function Explore() {
   const [currentInstruction, setCurrentInstruction] = useState(null);
   const [nextInstruction, setNextInstruction] = useState(null);
 
+  const PRE_ALERT_METERS = 150; // was 50
+
+  // live refs to avoid stale closures inside the watcher
+  const stepsRef = useRef([]);
+  const routeCoordsRef = useRef([]);
+  const activeStepIndexRef = useRef(0);
+
+  useEffect(() => { stepsRef.current = steps; }, [steps]);
+  useEffect(() => { routeCoordsRef.current = routeCoords; }, [routeCoords]);
+  useEffect(() => { activeStepIndexRef.current = activeStepIndex; }, [activeStepIndex]);
+
+  const handleUserProgressRef = useRef(() => { });
+  useEffect(() => { handleUserProgressRef.current = handleUserProgress; }, [handleUserProgress]);
+
+  const headingWatchRef = useRef(null);
 
   // ↓ add these lines here
   const [tracks, setTracks] = useState(true);
@@ -281,8 +296,6 @@ export default function Explore() {
     );
 
     if (!feature) {
-      console.warn(`❌ Lot ${lotId} not found in slotData`);
-      console.log("Available lot_ids:", slotData.features.map(f => f.properties?.lot_id));
       return null;
     }
 
@@ -297,15 +310,13 @@ export default function Explore() {
       return null;
     }
 
-    console.log([lat, lng])
+
     // 🔑 Snap this lot centroid to nearest road node
     const nearestKey = findNearest([lat, lng]);
     if (!nearestKey) {
       console.warn(`⚠️ Could not snap lot ${lotId} to road`);
       return null;
     }
-
-    console.log(`✅ Lot ${lotId} snapped to`, nodeList.current[nearestKey]);
     return nodeList.current[nearestKey];
   }
 
@@ -327,11 +338,6 @@ export default function Explore() {
       latitude: nodeList.current[k][0],
       longitude: nodeList.current[k][1]
     }));
-
-    console.log("Pickup lot:", pickupLot, "coords:", pickupCoords);
-    console.log("Drop lot:", dropLot, "coords:", dropCoords);
-    console.log("StartKey:", startKey, "EndKey:", endKey);
-    console.log("Path keys:", pathKeys.length);
 
     // ✅ Calculate total distance & ETA
     let totalMeters = 0;
@@ -393,63 +399,72 @@ export default function Explore() {
    * routeCoords: [{ latitude, longitude }, ...]
    */
   function buildInstructions(routeCoords) {
-    const pts = routeCoords.map(p => [p.latitude, p.longitude]); // [lat,lng]
+    const pts = routeCoords.map(p => [p.latitude, p.longitude]);
     if (pts.length < 2) return [];
 
-    // segment bearings + distances
-    const segs = [];
+    const segBrg = [];
+    const segDist = [];
     for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i], b = pts[i + 1];
-      segs.push({
-        dist: haversine(a, b),     // you already have haversine (meters)
-        brg: bearing(a, b),
-      });
+      segBrg.push(bearing(pts[i], pts[i + 1]));
+      segDist.push(haversine(pts[i], pts[i + 1]));
     }
 
     const out = [];
-    // Start
-    out.push({ type: 'start', text: `Head ${compassDir(segs[0].brg)}`, distance: 0 });
+    // Start at the first vertex (0)
+    out.push({ type: 'start', text: `Head ${compassDir(segBrg[0])}`, distance: 0, anchorIdx: 0 });
 
-    let accDist = segs[0].dist;
-    let prevBrg = segs[0].brg;
+    let accDist = segDist[0];
+    let prevBrg = segBrg[0];
 
-    for (let i = 1; i < segs.length; i++) {
-      const d = deltaAngle(prevBrg, segs[i].brg);
+    for (let i = 1; i < segBrg.length; i++) {
+      const d = deltaAngle(prevBrg, segBrg[i]);
       const ad = Math.abs(d);
 
-      // keep straight if tiny direction change
+      // small direction change → still straight
       if (ad < 15) {
-        accDist += segs[i].dist;
-        prevBrg = segs[i].brg;
+        accDist += segDist[i];
+        prevBrg = segBrg[i];
         continue;
       }
 
-      // close the straight chunk
+      // finish the straight up to vertex i
       if (accDist > 0) {
-        out.push({ type: 'straight', text: 'Continue straight', distance: accDist });
+        out.push({
+          type: 'straight',
+          text: 'Continue straight',
+          distance: accDist,
+          anchorIdx: i, // end of this straight run occurs at vertex i
+        });
       }
 
-      // turn
+      // add the turn at vertex i
       let text;
       if (ad >= 135) text = 'Make a U-turn';
       else if (ad >= 45) text = d > 0 ? 'Turn right' : 'Turn left';
       else text = d > 0 ? 'Slight right' : 'Slight left';
 
-      out.push({ type: 'turn', text, distance: 0 });
+      out.push({ type: 'turn', text, distance: 0, anchorIdx: i });
 
-      // start new straight accumulation
-      accDist = segs[i].dist;
-      prevBrg = segs[i].brg;
+      // start fresh straight accumulation from i
+      accDist = segDist[i];
+      prevBrg = segBrg[i];
     }
 
-    // finalize last straight
-    if (accDist > 0) out.push({ type: 'straight', text: 'Continue straight', distance: accDist });
+    // finalize last straight to the end (last vertex index = pts.length - 1)
+    if (accDist > 0) {
+      out.push({
+        type: 'straight',
+        text: 'Continue straight',
+        distance: accDist,
+        anchorIdx: pts.length - 1,
+      });
+    }
 
-    // arrive
-    out.push({ type: 'arrive', text: 'You have arrived', distance: 0 });
+    out.push({ type: 'arrive', text: 'You have arrived', distance: 0, anchorIdx: pts.length - 1 });
 
     return out;
   }
+
 
   function iconForStep(step) {
     if (!step) {
@@ -486,26 +501,29 @@ export default function Explore() {
 
   // Start Navigation
   async function startNavigation() {
+    // clean any previous watchers if Start is tapped again
+    if (watcherRef.current) { watcherRef.current.remove(); watcherRef.current = null; }
+    if (headingWatchRef.current) { headingWatchRef.current.remove(); headingWatchRef.current = null; }
+
+    // 1) Get current fix
     let loc = await Location.getCurrentPositionAsync({});
     const userCoords = [loc.coords.latitude, loc.coords.longitude];
 
-    // snap user position
+    // 2) Snap start/end to graph
     const startKey = findNearest(userCoords);
     const endKey = findNearest(getCoordsFromLot(dropLot));
-
     if (!startKey || !endKey) {
       alert("Unable to start navigation, road network missing nearby.");
       return;
     }
 
+    // 3) Build route + fit camera
     const pathKeys = dijkstra(startKey, endKey);
     const coordsPath = pathKeys.map(k => ({
       latitude: nodeList.current[k][0],
       longitude: nodeList.current[k][1],
     }));
-
     setRouteCoords(coordsPath);
-
     if (coordsPath.length >= 2 && mapRef.current) {
       mapRef.current.fitToCoordinates(coordsPath, {
         edgePadding: { top: 50, right: 50, bottom: 50, left: 50 },
@@ -513,33 +531,53 @@ export default function Explore() {
       });
     }
 
-    // Activate navigation
+    // 4) Turn on nav + build steps + seed instruction bar
     setNavActive(true);
-
-    // Build step instructions
     const built = buildInstructions(coordsPath);
     setSteps(built);
     setActiveStepIndex(0);
     setCurrentInstruction(built[0] || null);
     setNextInstruction(built[1] || null);
 
-    // Start watching user location + heading
+    // 5) Start high-frequency position updates
+    const accuracy = Platform.OS === 'ios'
+      ? Location.Accuracy.BestForNavigation
+      : Location.Accuracy.Highest;
+
     watcherRef.current = await Location.watchPositionAsync(
       {
-        accuracy: Location.Accuracy.High,
-        timeInterval: 2000,
-        distanceInterval: 3,
+        accuracy,
+        timeInterval: 1000,           // ~1s
+        distanceInterval: 1,          // ~1m
+        mayShowUserSettingsDialog: true,
+        pausesUpdatesAutomatically: false,
       },
       (locUpdate) => {
         const { latitude, longitude, heading } = locUpdate.coords;
         setUserPosition({ latitude, longitude });
-        if (heading !== null) setUserHeading(heading);
+        if (heading != null) setUserHeading(heading);
 
-        handleUserProgress([latitude, longitude]);
+        logNav('GPS', {
+          lat: latitude.toFixed(6),
+          lon: longitude.toFixed(6),
+          heading,
+          t: new Date().toISOString()
+        });
+
+        // always use the freshest handler (no stale closure)
+        handleUserProgressRef.current([latitude, longitude]);
       }
     );
 
-    // Announce first instruction
+    // 6) Start heading stream (compass/gyro)
+    // iOS provides trueHeading; Android may provide magHeading.
+    headingWatchRef.current = await Location.watchHeadingAsync(({ trueHeading, magHeading }) => {
+      const h = (trueHeading ?? magHeading ?? 0);
+      setUserHeading(h);
+      console.log('heading', h);
+    });
+
+    // 7) Speak the first instruction
     if (built.length) {
       speakInstruction(built[0].text);
     }
@@ -558,10 +596,13 @@ export default function Explore() {
     setUserPosition(null);
     setUserHeading(0);
 
-
     if (watcherRef.current) {
       watcherRef.current.remove();
       watcherRef.current = null;
+    }
+    if (headingWatchRef.current) {
+      headingWatchRef.current.remove();
+      headingWatchRef.current = null;
     }
 
     setActiveStepIndex(0);
@@ -569,54 +610,72 @@ export default function Explore() {
   }
 
 
+
   // match user location to route
   function handleUserProgress(userCoord) {
-    if (!routeCoords.length || !steps.length) return;
+    const route = routeCoordsRef.current;
+    const stepsLocal = stepsRef.current;
+    let stepIdx = activeStepIndexRef.current; // this is the STEP index now (not a route vertex index)
 
-    // Find closest point on the route to the user
+    if (!route.length || !stepsLocal.length) return;
+
+    // 1) Find closest vertex on the route to user
     let minDist = Infinity;
     let closestIdx = 0;
-    for (let i = 0; i < routeCoords.length; i++) {
-      const p = routeCoords[i];
+    for (let i = 0; i < route.length; i++) {
+      const p = route[i];
       const d = haversine(userCoord, [p.latitude, p.longitude]);
-      if (d < minDist) {
-        minDist = d;
-        closestIdx = i;
-      }
+      if (d < minDist) { minDist = d; closestIdx = i; }
     }
 
-    // Move to next step when passing its anchor point
-    // (we use the closest route point index as a coarse proxy)
-    if (closestIdx >= activeStepIndex && closestIdx < steps.length) {
-      setActiveStepIndex(closestIdx);
+    // 2) Advance step when passing the next anchor
+    //    nextStep.anchorIdx is a vertex index on the route
+    while (stepIdx + 1 < stepsLocal.length &&
+      closestIdx >= (stepsLocal[stepIdx + 1].anchorIdx ?? Number.POSITIVE_INFINITY)) {
+      stepIdx++;
+    }
 
-      const cur = steps[closestIdx];
-      const nxt = steps[closestIdx + 1] || null;
+    // 3) If step changed, update state + speak
+    if (stepIdx !== activeStepIndexRef.current) {
+      activeStepIndexRef.current = stepIdx;
+      setActiveStepIndex(stepIdx);
+
+      const cur = stepsLocal[stepIdx];
+      const nxt = stepsLocal[stepIdx + 1] || null;
 
       setCurrentInstruction(cur || null);
       setNextInstruction(nxt);
 
-      // Pre-alert when approaching a turn (50 m)
-      if (cur?.type === 'turn' && minDist <= 50 && !cur.preAlerted) {
-        speakInstruction(`In 50 meters, ${cur.text.toLowerCase()}`);
-        cur.preAlerted = true; // mark so we don't repeat
-      }
-
-      // Speak on transition
       if (cur?.type === 'turn') {
-        speakInstruction(cur.text);
+        speakInstruction(cur.text); // announce the turn at the anchor
       } else if (cur?.type === 'arrive') {
         speakInstruction('You have arrived at your destination');
         stopNavigation();
-        // optional: clear bar after a short delay
         setTimeout(() => {
           setCurrentInstruction(null);
           setNextInstruction(null);
-        }, 5000);
+        }, 3000);
+        return;
+      }
+    }
+
+    // 4) Pre-alert based on remaining distance to the NEXT TURN (not time)
+    const nextStep = stepsLocal[activeStepIndexRef.current + 1];
+    if (nextStep?.type === 'turn') {
+      const anchor = nextStep.anchorIdx ?? (route.length - 1);
+      let remain = 0;
+      for (let i = closestIdx; i < anchor; i++) {
+        const a = [route[i].latitude, route[i].longitude];
+        const b = [route[i + 1].latitude, route[i + 1].longitude];
+        remain += haversine(a, b);
+      }
+
+      if (remain <= PRE_ALERT_METERS && !nextStep.preAlerted) {
+        nextStep.preAlerted = true; // avoid repeat
+        speakInstruction(`In 150 meters, ${nextStep.text.toLowerCase()}`);
       }
     }
   }
-
 
   useEffect(() => {
     initLocation();
@@ -648,7 +707,7 @@ export default function Explore() {
     }
   }
 
-
+  const logNav = (...args) => { if (__DEV__) console.log(...args); };
 
   return (
     <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
